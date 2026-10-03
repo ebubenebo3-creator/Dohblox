@@ -5,6 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
     <title>DOH BLOX - PC Edition</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <!-- Firebase compat SDK: public Studio catalog + anonymous creator identity -->
+    <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
     <style>
         * { box-sizing: border-box; touch-action: manipulation; }
         body {
@@ -885,6 +889,7 @@
         <button class="studio-tool-btn" onclick="studioNewPlace()">New</button>
         <button class="studio-tool-btn" onclick="studioSaveDraft()">Save</button>
         <button class="studio-tool-btn blue" onclick="studioShowPublishDialog()">Publish</button>
+        <button class="studio-tool-btn" onclick="studioConfigurePublicBackend()">Firebase Setup</button>
         <button class="studio-tool-btn" onclick="studioExportPlace()">Export</button>
         <button class="studio-tool-btn" onclick="document.getElementById('studio-import-file').click()">Import</button>
         <input id="studio-import-file" type="file" accept="application/json,.json" class="hidden" onchange="studioImportPlace(event)">
@@ -975,7 +980,7 @@
             <div class="studio-output" id="studio-output"><div class="studio-output-line">Dohblox Studio ready.</div></div>
         </div>
         <div>
-            <div class="studio-panel-title"><span>Published Games</span><button class="studio-small-btn" onclick="loadPublishedStudioGames(true)">Refresh</button></div>
+            <div class="studio-panel-title"><span>My Published Games</span><button class="studio-small-btn" onclick="refreshPublicStudioGames(true,true)">Refresh Public</button></div>
             <div class="studio-published" id="studio-published-list"></div>
         </div>
     </div>
@@ -1691,6 +1696,9 @@
         ensurePizzaProgress();
         initDohbloxStudioSync();
         loadPublishedStudioGames(false);
+        refreshPublicStudioGames(true);
+        if(!publicStudioRefreshTimer) publicStudioRefreshTimer=setInterval(()=>refreshPublicStudioGames(true),20000);
+        window.addEventListener('focus',()=>refreshPublicStudioGames(true));
 
         initMultiplayerNetwork();
         renderHeader();
@@ -2230,6 +2238,7 @@
             card.innerHTML = `
                 <div class="card-banner"><canvas id="${canvasId}" width="260" height="120"></canvas></div>
                 <strong style="color:#0055b3; font-size:13px; display:block; margin-top:4px;">${studioEsc(g.title)}</strong>
+                ${g.type==='studio_published'?`<div style="font-size:10px;color:#777;margin-top:2px;">by ${studioEsc(g.owner||'Builder')}${g.public?' • Community':''}</div>`:''}
                 <p style="margin: 4px 0 8px 0; color:#444; font-size:11px; line-height:1.2; min-height: 28px;">${studioEsc(g.description)}</p>
                 <button class="btn-play">Play Game</button>`;
             card.querySelector('.btn-play').onclick=()=>launchGame(g.title,g.id);
@@ -4403,6 +4412,23 @@
        ============================================================ */
     const STUDIO_PUBLISHED_KEY = 'dohblox_studio_published_v3';
     const STUDIO_DRAFT_KEY = 'dohblox_studio_draft_v3';
+
+    /* FIREBASE PUBLIC COMMUNITY GAMES
+       Replace these TWO values before releasing so every visitor automatically uses
+       the same public community catalog. The Firebase Web API key is intended to be
+       public; security is enforced by Firestore Rules. Never embed a service-account
+       private key in this file. */
+    const FIREBASE_STUDIO_DEFAULT = {
+        projectId: 'YOUR_FIREBASE_PROJECT_ID',
+        apiKey: 'YOUR_FIREBASE_WEB_API_KEY',
+        authDomain: ''
+    };
+    const FIREBASE_STUDIO_SETTINGS_KEY = 'dohblox_firebase_public_studio_v1';
+    let firebaseStudioApp=null, firebaseStudioAuth=null, firebaseStudioDb=null, firebaseStudioUser=null;
+    let publicStudioGamesCache=[];
+    let publicStudioRefreshInFlight=null;
+    let publicStudioRefreshTimer=null;
+
     let studioPublishChannel = null;
     let studioScene = null, studioCamera = null, studioRenderer = null, studioAnimId = null;
     let studioWorld = null, studioSelectedId = null, studioSelectionHelper = null;
@@ -4435,6 +4461,97 @@
     function studioNewId(prefix='Part') { studioPartCounter++; return `${prefix}_${Date.now().toString(36)}_${studioPartCounter}`; }
     function studioEsc(s) { return String(s??'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
+    function getFirebaseStudioConfig() {
+        let override=null;
+        try { override=JSON.parse(localStorage.getItem(FIREBASE_STUDIO_SETTINGS_KEY)||'null'); } catch(_) {}
+        const base=(override&&typeof override==='object')?override:FIREBASE_STUDIO_DEFAULT;
+        const projectId=String(base.projectId||'').trim();
+        const apiKey=String(base.apiKey||'').trim();
+        const authDomain=String(base.authDomain||((projectId && !projectId.includes('YOUR_')) ? projectId+'.firebaseapp.com' : '')).trim();
+        return {apiKey,projectId,authDomain};
+    }
+
+    function isFirebaseStudioConfigured() {
+        const c=getFirebaseStudioConfig();
+        return typeof firebase!=='undefined' && c.apiKey.length>20 && !c.apiKey.includes('YOUR_FIREBASE') && c.projectId.length>3 && !c.projectId.includes('YOUR_FIREBASE');
+    }
+
+    function studioConfigurePublicBackend() {
+        const current=getFirebaseStudioConfig();
+        const projectId=prompt('Firebase Project ID (example: my-dohblox-project):', current.projectId.includes('YOUR_FIREBASE')?'':current.projectId);
+        if(projectId===null)return;
+        const apiKey=prompt('Firebase Web API key (safe/public key — NOT a service-account private key):', current.apiKey.includes('YOUR_FIREBASE')?'':current.apiKey);
+        if(apiKey===null)return;
+        const cleanProject=String(projectId).trim();
+        const cleanKey=String(apiKey).trim();
+        if(cleanProject.length<4 || cleanKey.length<20){alert('That Firebase configuration does not look valid.');return;}
+        const cfg={projectId:cleanProject,apiKey:cleanKey,authDomain:cleanProject+'.firebaseapp.com'};
+        localStorage.setItem(FIREBASE_STUDIO_SETTINGS_KEY,JSON.stringify(cfg));
+        firebaseStudioApp=null;firebaseStudioAuth=null;firebaseStudioDb=null;firebaseStudioUser=null;
+        studioOutput('Firebase public Studio configured. Testing connection…','ok');
+        refreshPublicStudioGames(true,true);
+    }
+
+    function firebaseStudioAppName(c) {
+        return 'dohblox-public-'+String(c.projectId||'project').replace(/[^a-z0-9_-]/gi,'_');
+    }
+
+    async function initFirebasePublicStudio(showResult=false) {
+        if(!isFirebaseStudioConfigured()) {
+            if(showResult) studioOutput('Firebase sharing is not configured. Use Firebase Setup or fill FIREBASE_STUDIO_DEFAULT in the HTML.','warn');
+            return false;
+        }
+        try {
+            const c=getFirebaseStudioConfig();
+            const appName=firebaseStudioAppName(c);
+            let app=null;
+            try { app=firebase.app(appName); } catch(_) { app=firebase.initializeApp(c,appName); }
+            firebaseStudioApp=app;
+            firebaseStudioAuth=app.auth();
+            firebaseStudioDb=app.firestore();
+            try { await firebaseStudioAuth.setPersistence(firebase.auth.Auth.Persistence.LOCAL); } catch(_) {}
+            if(!firebaseStudioAuth.currentUser) {
+                const cred=await firebaseStudioAuth.signInAnonymously();
+                firebaseStudioUser=cred.user;
+            } else firebaseStudioUser=firebaseStudioAuth.currentUser;
+            return true;
+        } catch(err) {
+            console.error('Firebase Studio init failed',err);
+            if(showResult) studioOutput('Firebase connection failed: '+err.message,'err');
+            return false;
+        }
+    }
+
+    function publicFirebaseDocToGame(doc) {
+        const d=doc.data()||{};
+        return {
+            studioId:String(doc.id), remoteId:String(doc.id), public:true,
+            title:d.title||'Untitled Place', description:d.description||'Made in Dohblox Studio.',
+            owner:d.creatorName||'Builder', ownerUid:d.ownerUid||'',
+            publishedAt:Number(d.createdAt)||0, updatedAt:Number(d.updatedAt)||0,
+            world:d.gameData||studioDefaultWorld()
+        };
+    }
+
+    async function refreshPublicStudioGames(refreshGrid=true,showResult=false) {
+        if(publicStudioRefreshInFlight)return publicStudioRefreshInFlight;
+        publicStudioRefreshInFlight=(async()=>{
+            try {
+                if(!await initFirebasePublicStudio(showResult)) return publicStudioGamesCache;
+                const snap=await firebaseStudioDb.collection('dohblox_games').where('published','==',true).limit(250).get();
+                publicStudioGamesCache=snap.docs.map(publicFirebaseDocToGame).sort((a,b)=>(b.updatedAt||b.publishedAt||0)-(a.updatedAt||a.publishedAt||0));
+                rebuildStudioPublishedGameRecords(refreshGrid);
+                if(showResult)studioOutput(`Firebase catalog connected — ${publicStudioGamesCache.length} community game(s) loaded.`,'ok');
+                return publicStudioGamesCache;
+            } catch(err) {
+                console.error('Firebase public Studio refresh failed',err);
+                if(showResult)studioOutput('Firebase catalog error: '+err.message,'err');
+                return publicStudioGamesCache;
+            } finally { publicStudioRefreshInFlight=null; }
+        })();
+        return publicStudioRefreshInFlight;
+    }
+
     function initDohbloxStudioSync() {
         if ('BroadcastChannel' in window && !studioPublishChannel) {
             studioPublishChannel = new BroadcastChannel('dohblox_studio_publish_v3');
@@ -4442,52 +4559,73 @@
                 const msg=e.data||{};
                 if(msg.type==='PUBLISH_SYNC' && msg.game){
                     let arr=[]; try{arr=JSON.parse(localStorage.getItem(STUDIO_PUBLISHED_KEY)||'[]')}catch(_){}
-                    const idx=arr.findIndex(g=>g.studioId===msg.game.studioId);
+                    const idx=arr.findIndex(g=>String(g.studioId)===String(msg.game.studioId));
                     if(idx>=0) arr[idx]=msg.game; else arr.push(msg.game);
                     localStorage.setItem(STUDIO_PUBLISHED_KEY,JSON.stringify(arr));
                     loadPublishedStudioGames(true);
                     studioOutput(`Synced published game: ${msg.game.title}`,'ok');
                 } else if(msg.type==='DELETE_SYNC' && msg.studioId){
                     let arr=[]; try{arr=JSON.parse(localStorage.getItem(STUDIO_PUBLISHED_KEY)||'[]')}catch(_){}
-                    arr=arr.filter(g=>g.studioId!==msg.studioId); localStorage.setItem(STUDIO_PUBLISHED_KEY,JSON.stringify(arr));
+                    arr=arr.filter(g=>String(g.studioId)!==String(msg.studioId)); localStorage.setItem(STUDIO_PUBLISHED_KEY,JSON.stringify(arr));
                     loadPublishedStudioGames(true);
+                } else if(msg.type==='PUBLIC_REFRESH') {
+                    refreshPublicStudioGames(true);
                 }
             };
         }
-        window.addEventListener('storage', (e)=>{ if(e.key===STUDIO_PUBLISHED_KEY) loadPublishedStudioGames(true); });
+        window.addEventListener('storage', (e)=>{
+            if(e.key===STUDIO_PUBLISHED_KEY) loadPublishedStudioGames(true);
+            if(e.key===FIREBASE_STUDIO_SETTINGS_KEY){firebaseStudioApp=null;firebaseStudioAuth=null;firebaseStudioDb=null;firebaseStudioUser=null;refreshPublicStudioGames(true,true);}
+        });
     }
 
     function getStoredPublishedStudioGames() {
         try { const a=JSON.parse(localStorage.getItem(STUDIO_PUBLISHED_KEY)||'[]'); return Array.isArray(a)?a:[]; } catch(e){ return []; }
     }
 
-    function loadPublishedStudioGames(refreshGrid=false) {
+    function saveOwnedPublishedStudioGame(game,removeOldId=null) {
+        let arr=getStoredPublishedStudioGames();
+        if(removeOldId && String(removeOldId)!==String(game.studioId))arr=arr.filter(g=>String(g.studioId)!==String(removeOldId));
+        const idx=arr.findIndex(g=>String(g.studioId)===String(game.studioId));
+        if(idx>=0)arr[idx]=game;else arr.push(game);
+        localStorage.setItem(STUDIO_PUBLISHED_KEY,JSON.stringify(arr));
+    }
+
+    function rebuildStudioPublishedGameRecords(refreshGrid=false) {
         gamesDatabase = gamesDatabase.filter(g=>g.type!=='studio_published');
-        const published=getStoredPublishedStudioGames();
-        published.forEach((g,i)=>{
+        const merged=new Map();
+        getStoredPublishedStudioGames().forEach(g=>merged.set(String(g.studioId),g));
+        publicStudioGamesCache.forEach(g=>merged.set(String(g.studioId),g));
+        Array.from(merged.values()).sort((a,b)=>(b.updatedAt||b.publishedAt||0)-(a.updatedAt||a.publishedAt||0)).forEach((g,i)=>{
             gamesDatabase.push({
-                id:g.studioId || `studio_${i}`,
-                studioId:g.studioId,
-                title:g.title || 'Untitled Place',
-                type:'studio_published',
+                id:g.studioId || `studio_${i}`, studioId:g.studioId,
+                title:g.title || 'Untitled Place', type:'studio_published',
                 description:g.description || 'Made in Dohblox Studio.',
-                studioWorld:g.world || studioDefaultWorld(),
-                owner:g.owner || 'Builder',
-                publishedAt:g.publishedAt || 0
+                studioWorld:g.world || studioDefaultWorld(), owner:g.owner || 'Builder', ownerUid:g.ownerUid||'',
+                publishedAt:g.publishedAt || 0, public:!!g.public
             });
         });
         if(refreshGrid && document.getElementById('games-grid-container')) renderGamesGrid();
         renderStudioPublishedList();
     }
 
+    function loadPublishedStudioGames(refreshGrid=false) {
+        rebuildStudioPublishedGameRecords(refreshGrid);
+        if(isFirebaseStudioConfigured())refreshPublicStudioGames(refreshGrid);
+    }
+
     function renderStudioPublishedList() {
         const box=document.getElementById('studio-published-list'); if(!box) return;
         const games=getStoredPublishedStudioGames();
-        if(!games.length){box.innerHTML='<div style="color:#999;padding:5px 0">No published Studio games yet.</div>';return;}
+        if(!games.length){
+            box.innerHTML='<div style="color:#999;padding:5px 0">You have not published a Studio game from this browser yet.</div>';
+            return;
+        }
         box.innerHTML='';
-        games.slice().reverse().forEach(g=>{
+        games.slice().sort((a,b)=>(b.updatedAt||b.publishedAt||0)-(a.updatedAt||a.publishedAt||0)).forEach(g=>{
             const row=document.createElement('div'); row.className='studio-published-row';
-            row.innerHTML=`<span title="${studioEsc(g.description||'')}"><strong>${studioEsc(g.title)}</strong><br><span style="color:#999">${studioEsc(g.owner||'Builder')}</span></span><span><button class="studio-small-btn">Edit</button> <button class="studio-small-btn">Delete</button></span>`;
+            const badge=g.public?' <span style="color:#77d477">PUBLIC</span>':' <span style="color:#e7c76c">LOCAL</span>';
+            row.innerHTML=`<span title="${studioEsc(g.description||'')}"><strong>${studioEsc(g.title)}</strong>${badge}<br><span style="color:#999">${studioEsc(g.owner||'Builder')}</span></span><span><button class="studio-small-btn">Edit</button> <button class="studio-small-btn">Delete</button></span>`;
             const btns=row.querySelectorAll('button');
             btns[0].onclick=()=>studioEditPublished(g.studioId);
             btns[1].onclick=()=>studioDeletePublished(g.studioId);
@@ -4496,18 +4634,27 @@
     }
 
     function studioEditPublished(id){
-        const g=getStoredPublishedStudioGames().find(x=>x.studioId===id); if(!g)return;
+        const g=getStoredPublishedStudioGames().find(x=>String(x.studioId)===String(id)); if(!g)return;
         studioPushHistory(); studioWorld=studioClone(g.world); studioWorld.title=g.title; studioWorld.description=g.description;
-        studioCurrentPublishedId=id; studioSelectedId=null; studioHistory=[]; studioRedoStack=[]; studioRebuildScene(); studioSyncProperties();
-        studioOutput(`Opened published place: ${g.title}`,'ok');
+        studioCurrentPublishedId=String(id); studioSelectedId=null; studioHistory=[]; studioRedoStack=[]; studioRebuildScene(); studioSyncProperties();
+        studioOutput(`Opened ${g.public?'public':'local'} published place: ${g.title}`,'ok');
     }
 
-    function studioDeletePublished(id){
-        if(!confirm('Delete this published Dohblox game?'))return;
-        let a=getStoredPublishedStudioGames().filter(g=>g.studioId!==id); localStorage.setItem(STUDIO_PUBLISHED_KEY,JSON.stringify(a));
+    async function studioDeletePublished(id){
+        const g=getStoredPublishedStudioGames().find(x=>String(x.studioId)===String(id));
+        if(!g)return;
+        if(!confirm(`Delete “${g.title}”${g.public?' from the public Dohblox catalog':''}?`))return;
+        if(g.public){
+            if(!await initFirebasePublicStudio(true)){alert('Connect Firebase before deleting this public game.');return;}
+            if(!firebaseStudioUser || !g.ownerUid || g.ownerUid!==firebaseStudioUser.uid){alert('This browser is not signed in as the Firebase creator of that game, so it cannot delete it.');return;}
+            try { await firebaseStudioDb.collection('dohblox_games').doc(String(id)).delete(); }
+            catch(err){studioOutput('Public delete failed: '+err.message,'err');alert('Could not delete the public game. Nothing was removed locally.');return;}
+        }
+        let a=getStoredPublishedStudioGames().filter(x=>String(x.studioId)!==String(id));localStorage.setItem(STUDIO_PUBLISHED_KEY,JSON.stringify(a));
         if(studioPublishChannel)studioPublishChannel.postMessage({type:'DELETE_SYNC',studioId:id});
-        if(studioCurrentPublishedId===id)studioCurrentPublishedId=null;
-        loadPublishedStudioGames(true); studioOutput('Published game deleted.','warn');
+        if(studioCurrentPublishedId===String(id))studioCurrentPublishedId=null;
+        if(g.public)await refreshPublicStudioGames(true);else loadPublishedStudioGames(true);
+        studioOutput(g.public?'Public game deleted.':'Local published game deleted.','warn');
     }
 
     function studioOutput(message,type=''){
@@ -4664,9 +4811,59 @@
 
     function studioShowPublishDialog(){document.getElementById('studio-publish-name').value=studioWorld.title||'My Dohblox Place';document.getElementById('studio-publish-description').value=studioWorld.description||'Made in Dohblox Studio.';document.getElementById('studio-publish-dialog').classList.remove('hidden');}
     function studioHidePublishDialog(){document.getElementById('studio-publish-dialog').classList.add('hidden');}
-    function studioPublishPlace(){
-        const title=document.getElementById('studio-publish-name').value.trim();if(!title){alert('Give your game a name first.');return;}const desc=document.getElementById('studio-publish-description').value.trim();studioWorld.title=title;studioWorld.description=desc;
-        let arr=getStoredPublishedStudioGames();let id=studioCurrentPublishedId||('studio_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,7));const game={studioId:id,title,description:desc,owner:currentUser.username||'Builder',publishedAt:Date.now(),world:studioClone(studioWorld)};const idx=arr.findIndex(g=>g.studioId===id);if(idx>=0)arr[idx]=game;else arr.push(game);localStorage.setItem(STUDIO_PUBLISHED_KEY,JSON.stringify(arr));studioCurrentPublishedId=id;studioSaveDraft(true);if(studioPublishChannel)studioPublishChannel.postMessage({type:'PUBLISH_SYNC',game});loadPublishedStudioGames(true);studioHidePublishDialog();studioOutput(`Published “${title}”. It is now on the Games page.`,'ok');
+    async function studioPublishPlace(){
+        const title=document.getElementById('studio-publish-name').value.trim();
+        if(!title){alert('Give your game a name first.');return;}
+        const desc=document.getElementById('studio-publish-description').value.trim();
+        studioWorld.title=title;studioWorld.description=desc;
+        const worldCopy=studioClone(studioWorld);
+        const approxBytes=new Blob([JSON.stringify(worldCopy)]).size;
+        if(approxBytes>850000){alert('This place is too large for one public Firebase game document. Reduce the number/size of Studio parts, then publish again.');return;}
+
+        if(!isFirebaseStudioConfigured()){
+            const ok=confirm('Firebase public sharing is not configured yet. Press OK to save this game locally only, or Cancel and use Firebase Setup first.');
+            if(!ok)return;
+            let id=studioCurrentPublishedId||('studio_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,7));
+            const now=Date.now();
+            const game={studioId:id,title,description:desc,owner:currentUser.username||'Builder',publishedAt:now,updatedAt:now,world:worldCopy,public:false};
+            saveOwnedPublishedStudioGame(game);studioCurrentPublishedId=String(id);studioSaveDraft(true);
+            if(studioPublishChannel)studioPublishChannel.postMessage({type:'PUBLISH_SYNC',game});
+            loadPublishedStudioGames(true);studioHidePublishDialog();studioOutput(`Saved “${title}” locally. Use Firebase Setup to share it with everyone.`,'warn');
+            return;
+        }
+
+        if(!await initFirebasePublicStudio(true)){alert('Firebase could not connect. Your Studio draft is still safe.');return;}
+        const uid=firebaseStudioUser&&firebaseStudioUser.uid;
+        if(!uid){alert('Firebase anonymous sign-in failed. Enable Anonymous Authentication in Firebase.');return;}
+
+        const oldId=studioCurrentPublishedId;
+        const oldLocal=oldId?getStoredPublishedStudioGames().find(g=>String(g.studioId)===String(oldId)):null;
+        const canUpdate=!!(oldLocal&&oldLocal.public&&oldLocal.ownerUid===uid);
+        const id=canUpdate?String(oldId):('studio_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8));
+        const now=Date.now();
+        const createdAt=canUpdate?(oldLocal.publishedAt||oldLocal.createdAt||now):now;
+        studioOutput(canUpdate?`Updating public game “${title}”…`:`Publishing “${title}” to Firebase…`);
+        try {
+            const payload={
+                title:title.slice(0,48),
+                description:desc.slice(0,180),
+                creatorName:String(currentUser.username||'Builder').slice(0,32),
+                ownerUid:uid,
+                published:true,
+                createdAt,
+                updatedAt:now,
+                gameData:worldCopy
+            };
+            await firebaseStudioDb.collection('dohblox_games').doc(id).set(payload,{merge:canUpdate});
+            const game={studioId:id,remoteId:id,title,description:desc,owner:currentUser.username||'Builder',ownerUid:uid,publishedAt:createdAt,updatedAt:now,world:worldCopy,public:true};
+            saveOwnedPublishedStudioGame(game,oldId);studioCurrentPublishedId=id;studioSaveDraft(true);
+            if(studioPublishChannel){studioPublishChannel.postMessage({type:'PUBLISH_SYNC',game});studioPublishChannel.postMessage({type:'PUBLIC_REFRESH'});}
+            await refreshPublicStudioGames(true);
+            studioHidePublishDialog();studioOutput(`Published “${title}” publicly with Firebase. Everyone using the same Dohblox Firebase project can now see and play it.`,'ok');
+        } catch(err) {
+            console.error(err);studioOutput('Firebase publish failed: '+err.message,'err');
+            alert('Public publish failed. Your Studio draft is still safe. Check Firebase Setup, enable Anonymous Authentication, create Firestore, and install the supplied Firestore rules.');
+        }
     }
 
     function studioExportPlace(){const blob=new Blob([JSON.stringify(studioWorld,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=(studioWorld.title||'dohblox-place').replace(/[^a-z0-9_-]+/gi,'_')+'.dohplace.json';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),500);studioOutput('Place exported as JSON.','ok');}
