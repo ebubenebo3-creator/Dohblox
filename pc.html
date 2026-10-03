@@ -1169,13 +1169,21 @@
     let gameScene, gameCamera, gameRenderer;
     let activeGameTitle = null;
 
-    // MULTIPLAYER REAL-TIME NETWORKING (BROADCASTCHANNEL)
+
+    // MULTIPLAYER REAL-TIME NETWORKING (FIRESTORE ACROSS DEVICES + BROADCASTCHANNEL FALLBACK)
     let multiChannel = null;
     let localSessionId = 'sess_' + Math.random().toString(36).substr(2, 9) + '_' + Date.now();
-    let remotePlayers = {}; // sessionId -> { id, username, position, yaw, colors, equipped, mesh, chatBubbleEl, lastSeen }
+    let remotePlayers = {}; // sessionId -> live remote player
     let heartbeatTimer = null;
     let localChatBubble = null;
     let localSpawnShieldUntil = 0;
+    let cloudRoomPlayersUnsub = null;
+    let cloudRoomEventsUnsub = null;
+    let cloudRoomRef = null;
+    let cloudRoomId = null;
+    let cloudRoomJoinedAt = 0;
+    let cloudSeenEventIds = new Set();
+    let cloudRoomActive = false;
 
     function createPlayerNameTag(username) {
         const container = document.getElementById('world-chat-bubbles-container');
@@ -1620,8 +1628,7 @@
         document.getElementById('health-bar-text').innerText = Math.round(playerHealth);
     }
 
-    const accountOwnerUsername = "Owner";
-    let OWNER_PASSWORD = "Adminpassword123";
+    const accountOwnerUsername = "Owner"; // display/verification label only; moderator power comes from Firestore.
 
     let currentUser = {
         username: "Guest",
@@ -1658,10 +1665,8 @@
         { id: 5, name: "Epic Sword", price: 250, category: "gear", type: "sword" }
     ];
 
-    // NO BOTS IN DATABASE
-    let playersDatabase = [
-        { username: "Owner", isMod: true, isBanned: false, membership: "Outrageous Dohers Club", badges: [], bio: "Creator and Master Owner of Dohblox.", password: "Adminpassword123", friends: [], followers: [], friendRequests: [], inbox: [] }
-    ];
+    // Shared player directory is loaded from Firestore.
+    let playersDatabase = [];
 
     let activeReports = [];
     let viewingProfileUser = null;
@@ -1675,17 +1680,329 @@
     let editorScene, editorCamera, editorRenderer;
     let profileScene, profileCamera, profileRenderer;
 
-    function saveToStorage() {
-        localStorage.setItem('dohblox_user', JSON.stringify(currentUser));
-        localStorage.setItem('dohblox_players', JSON.stringify(playersDatabase));
+
+    // ============================================================
+    // DOHBLOX CLOUD ACCOUNTS + CROSS-DEVICE SOCIAL SYNC
+    // Passwords are handled only by Firebase Authentication.
+    // Public/profile data is stored in Firestore; no password is stored here.
+    // ============================================================
+    let dohbloxCloudAuth = null;
+    let dohbloxCloudDb = null;
+    let dohbloxCloudReady = false;
+    let dohbloxCloudInitPromise = null;
+    let dohbloxCloudUsersUnsub = null;
+    let dohbloxCloudCurrentProfileUnsub = null;
+    let dohbloxCloudRequestsUnsub = null;
+    let dohbloxCloudNotificationsUnsub = null;
+    let dohbloxCloudFriendshipsUnsub = null;
+    let dohbloxCloudProfileSaveTimer = null;
+    let dohbloxCloudCurrentUid = null;
+
+    function cleanPlayerRecordForCache(p) {
+        const copy = Object.assign({}, p || {});
+        delete copy.password;
+        return copy;
     }
 
-    window.onload = function() {
+    function saveToStorage() {
+        // Local storage is now only a cache/preferences layer, never a password database.
+        localStorage.setItem('dohblox_user', JSON.stringify(cleanPlayerRecordForCache(currentUser)));
+        localStorage.setItem('dohblox_players_cache', JSON.stringify(playersDatabase.map(cleanPlayerRecordForCache)));
+        localStorage.removeItem('dohblox_players'); // remove legacy plaintext-password database
+        scheduleCloudProfileSave();
+    }
+
+    function normalizeDohbloxUsername(name) {
+        return String(name || '').trim().toLowerCase();
+    }
+
+    function usernameToAuthEmail(name) {
+        const normalized = normalizeDohbloxUsername(name);
+        const bytes = new TextEncoder().encode(normalized);
+        let hex = '';
+        bytes.forEach(b => hex += b.toString(16).padStart(2, '0'));
+        return `u_${hex}@accounts.dohblox.invalid`;
+    }
+
+    function makeDefaultPlayerProfile(username) {
+        return {
+            username: String(username || 'Player').trim(),
+            normalizedUsername: normalizeDohbloxUsername(username),
+            balance: 0,
+            isMod: false,
+            isBanned: false,
+            membership: 'Member',
+            badges: [],
+            bio: 'New player!',
+            inventory: [],
+            equipped: [],
+            friends: [],
+            followers: [],
+            friendRequests: [],
+            inbox: [],
+            colors: { torso: 0x0055b3, limbs: 0xffcc00 }
+        };
+    }
+
+    function applyCloudProfileToCurrentUser(data, uid) {
+        if (!data) return;
+        const base = makeDefaultPlayerProfile(data.username || currentUser.username);
+        currentUser = Object.assign(base, currentUser || {}, data);
+        currentUser.uid = uid || data.uid || currentUser.uid || null;
+        currentUser.password = undefined;
+        delete currentUser.password;
+        if (!Array.isArray(currentUser.badges)) currentUser.badges = [];
+        if (!Array.isArray(currentUser.inventory)) currentUser.inventory = [];
+        if (!Array.isArray(currentUser.equipped)) currentUser.equipped = [];
+        if (!Array.isArray(currentUser.friends)) currentUser.friends = [];
+        if (!Array.isArray(currentUser.followers)) currentUser.followers = [];
+        if (!Array.isArray(currentUser.friendRequests)) currentUser.friendRequests = [];
+        if (!Array.isArray(currentUser.inbox)) currentUser.inbox = [];
+        if (!currentUser.colors) currentUser.colors = { torso: 0x0055b3, limbs: 0xffcc00 };
+        localStorage.setItem('dohblox_user', JSON.stringify(cleanPlayerRecordForCache(currentUser)));
+        renderHeader();
+        renderInbox();
+        if (viewingProfileUser) loadProfileView(viewingProfileUser);
+    }
+
+    function cloudProfilePayload() {
+        return {
+            username: currentUser.username,
+            normalizedUsername: normalizeDohbloxUsername(currentUser.username),
+            balance: Number(currentUser.balance) || 0,
+            membership: currentUser.membership || 'Member',
+            badges: Array.isArray(currentUser.badges) ? currentUser.badges : [],
+            bio: currentUser.bio || 'Welcome to Dohblox!',
+            inventory: Array.isArray(currentUser.inventory) ? currentUser.inventory : [],
+            equipped: Array.isArray(currentUser.equipped) ? currentUser.equipped : [],
+            colors: currentUser.colors || { torso: 0x0055b3, limbs: 0xffcc00 },
+            updatedAtMs: Date.now()
+        };
+    }
+
+    function scheduleCloudProfileSave() {
+        if (!dohbloxCloudReady || !dohbloxCloudAuth || !dohbloxCloudAuth.currentUser) return;
+        const user = dohbloxCloudAuth.currentUser;
+        if (user.isAnonymous || isGuestUser(currentUser.username)) return;
+        clearTimeout(dohbloxCloudProfileSaveTimer);
+        dohbloxCloudProfileSaveTimer = setTimeout(async () => {
+            try {
+                await dohbloxCloudDb.collection('dohblox_users').doc(user.uid).set(cloudProfilePayload(), { merge: true });
+            } catch (err) {
+                console.warn('Dohblox cloud profile save failed:', err);
+            }
+        }, 300);
+    }
+
+    async function ensureDohbloxCloud(showError = false) {
+        if (dohbloxCloudReady && dohbloxCloudDb && dohbloxCloudAuth) return true;
+        if (dohbloxCloudInitPromise) return dohbloxCloudInitPromise;
+        if (!isFirebaseStudioConfigured()) {
+            if (showError) alert('Firebase is not configured yet. Put your Firebase Project ID and Web API key into FIREBASE_STUDIO_DEFAULT (or use Firebase Setup on PC), then reload Dohblox.');
+            return false;
+        }
+        dohbloxCloudInitPromise = (async () => {
+            try {
+                const ok = await initFirebasePublicStudio(false);
+                if (!ok) throw new Error('Could not connect to Firebase.');
+                dohbloxCloudAuth = firebaseStudioAuth;
+                dohbloxCloudDb = firebaseStudioDb;
+                firebaseStudioUser = firebaseStudioAuth.currentUser;
+                dohbloxCloudReady = true;
+                subscribeCloudUsers();
+                return true;
+            } catch (err) {
+                console.error('Dohblox cloud startup failed:', err);
+                if (showError) alert('Dohblox cloud connection failed: ' + err.message);
+                return false;
+            } finally {
+                if (!dohbloxCloudReady) dohbloxCloudInitPromise = null;
+            }
+        })();
+        return dohbloxCloudInitPromise;
+    }
+
+    async function initDohbloxCloud() {
+        if (!await ensureDohbloxCloud(false)) return;
+        dohbloxCloudAuth.onAuthStateChanged(async user => {
+            if (!user) return;
+            firebaseStudioUser = user;
+            if (user.isAnonymous) {
+                dohbloxCloudCurrentUid = null;
+                unsubscribeCurrentSocial();
+                return;
+            }
+            dohbloxCloudCurrentUid = user.uid;
+            try {
+                const snap = await dohbloxCloudDb.collection('dohblox_users').doc(user.uid).get();
+                if (snap.exists) {
+                    const data = snap.data() || {};
+                    if (data.isBanned) {
+                        alert('This Dohblox account is banned.');
+                        await dohbloxCloudAuth.signOut();
+                        await dohbloxCloudAuth.signInAnonymously();
+                        return;
+                    }
+                    applyCloudProfileToCurrentUser(data, user.uid);
+                    subscribeCurrentSocial(user.uid);
+                }
+            } catch (err) {
+                console.warn('Could not restore cloud account:', err);
+            }
+        });
+    }
+
+    function subscribeCloudUsers() {
+        if (!dohbloxCloudDb || dohbloxCloudUsersUnsub) return;
+        dohbloxCloudUsersUnsub = dohbloxCloudDb.collection('dohblox_users').limit(500).onSnapshot(snap => {
+            playersDatabase = snap.docs.map(doc => {
+                const d = doc.data() || {};
+                return cleanPlayerRecordForCache(Object.assign(makeDefaultPlayerProfile(d.username || 'Player'), d, { uid: doc.id }));
+            });
+            localStorage.setItem('dohblox_players_cache', JSON.stringify(playersDatabase));
+            if (viewingProfileUser) loadProfileView(viewingProfileUser);
+        }, err => console.warn('User directory sync failed:', err));
+    }
+
+    function unsubscribeCurrentSocial() {
+        [dohbloxCloudCurrentProfileUnsub, dohbloxCloudRequestsUnsub, dohbloxCloudNotificationsUnsub, dohbloxCloudFriendshipsUnsub].forEach(fn => { try { if (fn) fn(); } catch (_) {} });
+        dohbloxCloudCurrentProfileUnsub = dohbloxCloudRequestsUnsub = dohbloxCloudNotificationsUnsub = dohbloxCloudFriendshipsUnsub = null;
+    }
+
+    function findCloudUserByName(name) {
+        const key = normalizeDohbloxUsername(name);
+        return playersDatabase.find(p => normalizeDohbloxUsername(p.username) === key) || null;
+    }
+
+    function makeFriendPairId(uidA, uidB) {
+        return [String(uidA), String(uidB)].sort().join('__');
+    }
+
+    function subscribeCurrentSocial(uid) {
+        if (!dohbloxCloudDb || !uid) return;
+        unsubscribeCurrentSocial();
+
+        dohbloxCloudCurrentProfileUnsub = dohbloxCloudDb.collection('dohblox_users').doc(uid).onSnapshot(doc => {
+            if (doc.exists && dohbloxCloudAuth && dohbloxCloudAuth.currentUser && dohbloxCloudAuth.currentUser.uid === uid) {
+                applyCloudProfileToCurrentUser(doc.data() || {}, uid);
+            }
+        }, err => console.warn('Current profile live sync failed:', err));
+
+        dohbloxCloudRequestsUnsub = dohbloxCloudDb.collection('dohblox_friend_requests').doc(uid).collection('requests')
+            .onSnapshot(snap => {
+                currentUser.friendRequests = snap.docs.map(d => (d.data() || {}).senderName).filter(Boolean);
+                renderInbox();
+            }, err => console.warn('Friend request sync failed:', err));
+
+        dohbloxCloudNotificationsUnsub = dohbloxCloudDb.collection('dohblox_notifications').doc(uid).collection('items')
+            .orderBy('createdAtMs', 'desc').limit(100)
+            .onSnapshot(snap => {
+                currentUser.inbox = snap.docs.map(d => {
+                    const x = d.data() || {};
+                    return { id: d.id, sender: x.senderName || 'System', text: x.text || '' };
+                });
+                renderInbox();
+            }, err => console.warn('Notification sync failed:', err));
+
+        dohbloxCloudFriendshipsUnsub = dohbloxCloudDb.collection('dohblox_friendships').where('members', 'array-contains', uid)
+            .onSnapshot(snap => {
+                const names = [];
+                snap.docs.forEach(doc => {
+                    const d = doc.data() || {};
+                    const members = Array.isArray(d.members) ? d.members : [];
+                    const memberNames = Array.isArray(d.memberNames) ? d.memberNames : [];
+                    const otherIndex = members.findIndex(x => x !== uid);
+                    if (otherIndex >= 0 && memberNames[otherIndex]) names.push(memberNames[otherIndex]);
+                });
+                currentUser.friends = Array.from(new Set(names));
+                renderInbox();
+                renderHeader();
+            }, err => console.warn('Friendship sync failed:', err));
+    }
+
+    async function cloudLoginOrCreate(username, password) {
+        if (!await ensureDohbloxCloud(true)) return false;
+        if (password.length < 6) {
+            alert('Passwords must be at least 6 characters for cloud accounts.');
+            return false;
+        }
+        const normalized = normalizeDohbloxUsername(username);
+        const email = usernameToAuthEmail(username);
+        const existingSnap = await dohbloxCloudDb.collection('dohblox_users').where('normalizedUsername', '==', normalized).limit(1).get();
+        let authUser;
+
+        if (!existingSnap.empty) {
+            try {
+                const cred = await dohbloxCloudAuth.signInWithEmailAndPassword(email, password);
+                authUser = cred.user;
+            } catch (err) {
+                console.warn('Cloud sign in failed:', err);
+                alert('Incorrect password for that username.');
+                return false;
+            }
+        } else {
+            try {
+                const cred = await dohbloxCloudAuth.createUserWithEmailAndPassword(email, password);
+                authUser = cred.user;
+                const profile = makeDefaultPlayerProfile(username);
+                await dohbloxCloudDb.collection('dohblox_users').doc(authUser.uid).set({
+                    username: profile.username,
+                    normalizedUsername: normalized,
+                    balance: 0,
+                    membership: 'Member',
+                    badges: [],
+                    bio: 'New player!',
+                    inventory: [],
+                    equipped: [],
+                    colors: profile.colors,
+                    isMod: false,
+                    isBanned: false,
+                    createdAtMs: Date.now(),
+                    updatedAtMs: Date.now()
+                });
+            } catch (err) {
+                console.error('Cloud account creation failed:', err);
+                if (err && err.code === 'auth/email-already-in-use') alert('That username already exists. Try logging in with its password.');
+                else alert('Could not create the cloud account: ' + (err.message || err));
+                return false;
+            }
+        }
+
+        firebaseStudioUser = authUser;
+        const profileSnap = await dohbloxCloudDb.collection('dohblox_users').doc(authUser.uid).get();
+        const data = profileSnap.exists ? profileSnap.data() : makeDefaultPlayerProfile(username);
+        if (data && data.isBanned) {
+            alert('This Dohblox account is banned.');
+            await dohbloxCloudAuth.signOut();
+            await dohbloxCloudAuth.signInAnonymously();
+            return false;
+        }
+        applyCloudProfileToCurrentUser(data, authUser.uid);
+        subscribeCurrentSocial(authUser.uid);
+        return true;
+    }
+
+    async function cloudLogout() {
+        unsubscribeCurrentSocial();
+        dohbloxCloudCurrentUid = null;
+        try {
+            if (await ensureDohbloxCloud(false)) {
+                await dohbloxCloudAuth.signOut();
+                const anonCred = await dohbloxCloudAuth.signInAnonymously();
+                firebaseStudioUser = anonCred.user;
+            }
+        } catch (err) {
+            console.warn('Cloud logout failed:', err);
+        }
+    }
+
+        window.onload = function() {
         const savedUser = localStorage.getItem('dohblox_user');
         if (savedUser) {
             try { currentUser = JSON.parse(savedUser); } catch(e) {}
         }
-        const savedPlayers = localStorage.getItem('dohblox_players');
+        localStorage.removeItem('dohblox_players');
+        const savedPlayers = localStorage.getItem('dohblox_players_cache');
         if (savedPlayers) {
             try { playersDatabase = JSON.parse(savedPlayers); } catch(e) {}
         }
@@ -1701,6 +2018,7 @@
         window.addEventListener('focus',()=>refreshPublicStudioGames(true));
 
         initMultiplayerNetwork();
+        initDohbloxCloud();
         renderHeader();
         renderGamesGrid();
         renderCatalog('all');
@@ -1709,27 +2027,142 @@
         setupKeyboardAndMouseListeners();
     };
 
-    /* REAL-TIME MULTIPLAYER SYSTEM VIA BROADCASTCHANNEL */
+
+    /* REAL-TIME MULTIPLAYER SYSTEM — FIRESTORE ACROSS BROWSERS/DEVICES */
     function initMultiplayerNetwork() {
+        // BroadcastChannel remains only as an offline/local fallback.
         if ('BroadcastChannel' in window) {
             multiChannel = new BroadcastChannel('dohblox_game_multiplayer');
             multiChannel.onmessage = handleNetworkMessage;
         }
     }
 
-    function sendNetworkMessage(type, payload = {}) {
-        if (!multiChannel || !activeGameTitle) return;
-        multiChannel.postMessage({
+    function hashRoomName(text) {
+        let h = 2166136261;
+        const s = String(text || 'dohblox');
+        for (let i = 0; i < s.length; i++) {
+            h ^= s.charCodeAt(i);
+            h = Math.imul(h, 16777619);
+        }
+        return (h >>> 0).toString(36);
+    }
+
+    function getActiveRoomKey(gameTitle) {
+        const gameIdentity = activeGameRecord && (activeGameRecord.studioId || activeGameRecord.id || activeGameRecord.title);
+        return `${gameIdentity || gameTitle || 'game'}|${gameTitle || ''}`;
+    }
+
+    async function joinCloudGameRoom(gameTitle) {
+        await leaveCloudGameRoom(false);
+        if (!await ensureDohbloxCloud(false)) {
+            cloudRoomActive = false;
+            return false;
+        }
+        try {
+            cloudRoomId = 'room_' + hashRoomName(getActiveRoomKey(gameTitle));
+            cloudRoomRef = dohbloxCloudDb.collection('dohblox_rooms').doc(cloudRoomId);
+            cloudRoomJoinedAt = Date.now();
+            cloudSeenEventIds.clear();
+            await cloudRoomRef.set({ gameTitle: gameTitle, updatedAtMs: Date.now() }, { merge: true });
+
+            cloudRoomPlayersUnsub = cloudRoomRef.collection('players').onSnapshot(snap => {
+                snap.docChanges().forEach(change => {
+                    const d = change.doc.data() || {};
+                    const sid = d.senderId || change.doc.id;
+                    if (!sid || sid === localSessionId) return;
+                    if (change.type === 'removed') {
+                        removeRemotePlayer(sid);
+                        return;
+                    }
+                    const synthetic = {
+                        senderId: sid,
+                        senderUid: d.uid || '',
+                        username: d.username || 'Player',
+                        gameTitle: activeGameTitle,
+                        type: 'STATE_UPDATE',
+                        payload: d.payload || {},
+                        timestamp: d.updatedAtMs || Date.now()
+                    };
+                    handleNetworkMessage({ data: synthetic });
+                });
+            }, err => console.warn('Multiplayer player sync failed:', err));
+
+            cloudRoomEventsUnsub = cloudRoomRef.collection('events').orderBy('createdAtMs', 'desc').limit(100).onSnapshot(snap => {
+                snap.docChanges().forEach(change => {
+                    if (change.type !== 'added') return;
+                    if (cloudSeenEventIds.has(change.doc.id)) return;
+                    cloudSeenEventIds.add(change.doc.id);
+                    const d = change.doc.data() || {};
+                    if ((d.createdAtMs || 0) < cloudRoomJoinedAt - 1500) return;
+                    if (d.senderId === localSessionId) return;
+                    handleNetworkMessage({ data: d });
+                });
+            }, err => console.warn('Multiplayer event sync failed:', err));
+
+            cloudRoomActive = true;
+            return true;
+        } catch (err) {
+            console.error('Could not join multiplayer room:', err);
+            cloudRoomActive = false;
+            return false;
+        }
+    }
+
+    async function leaveCloudGameRoom(deletePresence = true) {
+        try { if (cloudRoomPlayersUnsub) cloudRoomPlayersUnsub(); } catch (_) {}
+        try { if (cloudRoomEventsUnsub) cloudRoomEventsUnsub(); } catch (_) {}
+        cloudRoomPlayersUnsub = null;
+        cloudRoomEventsUnsub = null;
+        if (deletePresence && cloudRoomRef) {
+            try { await cloudRoomRef.collection('players').doc(localSessionId).delete(); } catch (_) {}
+        }
+        cloudRoomRef = null;
+        cloudRoomId = null;
+        cloudRoomActive = false;
+        cloudSeenEventIds.clear();
+    }
+
+    function makeNetworkEnvelope(type, payload = {}) {
+        return {
+            messageId: `${localSessionId}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
             senderId: localSessionId,
+            senderUid: dohbloxCloudAuth && dohbloxCloudAuth.currentUser ? dohbloxCloudAuth.currentUser.uid : '',
             username: currentUser.username,
             gameTitle: activeGameTitle,
             type: type,
             payload: payload,
+            createdAtMs: Date.now(),
             timestamp: Date.now()
-        });
+        };
     }
 
-    function handleNetworkMessage(e) {
+    function sendNetworkMessage(type, payload = {}) {
+        if (!activeGameTitle) return;
+        const msg = makeNetworkEnvelope(type, payload);
+
+        if (cloudRoomActive && cloudRoomRef) {
+            if (type === 'JOIN_GAME' || type === 'HEARTBEAT' || type === 'STATE_UPDATE') {
+                cloudRoomRef.collection('players').doc(localSessionId).set({
+                    senderId: localSessionId,
+                    uid: msg.senderUid,
+                    username: currentUser.username,
+                    gameTitle: activeGameTitle,
+                    payload: payload,
+                    updatedAtMs: Date.now()
+                }, { merge: true }).catch(err => console.warn('Player state send failed:', err));
+            } else if (type === 'LEAVE_GAME') {
+                cloudRoomRef.collection('players').doc(localSessionId).delete().catch(() => {});
+            } else {
+                cloudRoomRef.collection('events').add(msg).catch(err => console.warn('Multiplayer event send failed:', err));
+            }
+            return;
+        }
+
+        // Offline/same-device fallback.
+        if (multiChannel) multiChannel.postMessage(msg);
+    }
+
+        function handleNetworkMessage(e) {
         const msg = e.data;
         if (!msg || msg.senderId === localSessionId) return;
         if (!activeGameTitle || msg.gameTitle !== activeGameTitle) {
@@ -1995,6 +2428,7 @@
     window.addEventListener('beforeunload', () => {
         if (activeGameTitle) {
             sendNetworkMessage('LEAVE_GAME', {});
+            if (cloudRoomRef) cloudRoomRef.collection('players').doc(localSessionId).delete().catch(() => {});
         }
     });
 
@@ -2074,31 +2508,38 @@
         container.innerHTML = html;
     }
 
-    function acceptFriendRequest(fromUser) {
-        if(!currentUser.friends.includes(fromUser)) {
-            currentUser.friends.push(fromUser);
+
+    async function acceptFriendRequest(fromUser) {
+        const target = findCloudUserByName(fromUser);
+        if (target && target.uid && dohbloxCloudCurrentUid && await ensureDohbloxCloud(false)) {
+            const pairId = makeFriendPairId(dohbloxCloudCurrentUid, target.uid);
+            const members = [dohbloxCloudCurrentUid, target.uid].sort();
+            const nameByUid = {};
+            nameByUid[dohbloxCloudCurrentUid] = currentUser.username;
+            nameByUid[target.uid] = target.username;
+            const memberNames = members.map(uid => nameByUid[uid] || 'Player');
+            await dohbloxCloudDb.collection('dohblox_friendships').doc(pairId).set({ members, memberNames, createdAtMs: Date.now() });
+            await dohbloxCloudDb.collection('dohblox_friend_requests').doc(dohbloxCloudCurrentUid).collection('requests').doc(target.uid).delete().catch(() => {});
+            alert(`You are now friends with ${fromUser}!`);
+            return;
         }
+        if (!currentUser.friends.includes(fromUser)) currentUser.friends.push(fromUser);
         currentUser.friendRequests = currentUser.friendRequests.filter(u => u !== fromUser);
-        
-        let targetRec = playersDatabase.find(p => p.username.toLowerCase() === fromUser.toLowerCase());
-        if(targetRec) {
-            if(!targetRec.friends) targetRec.friends = [];
-            if(!targetRec.friends.includes(currentUser.username)) {
-                targetRec.friends.push(currentUser.username);
-            }
+        saveToStorage(); renderInbox();
+    }
+
+    
+    async function declineFriendRequest(idx) {
+        const fromUser = currentUser.friendRequests[idx];
+        const target = findCloudUserByName(fromUser);
+        if (target && target.uid && dohbloxCloudCurrentUid && await ensureDohbloxCloud(false)) {
+            await dohbloxCloudDb.collection('dohblox_friend_requests').doc(dohbloxCloudCurrentUid).collection('requests').doc(target.uid).delete().catch(() => {});
+            return;
         }
-        saveToStorage();
-        renderInbox();
-        alert(`You are now friends with ${fromUser}!`);
+        currentUser.friendRequests.splice(idx, 1); saveToStorage(); renderInbox();
     }
 
-    function declineFriendRequest(idx) {
-        currentUser.friendRequests.splice(idx, 1);
-        saveToStorage();
-        renderInbox();
-    }
-
-    function openInviteModal() {
+        function openInviteModal() {
         if(isGuestUser(currentUser.username)) {
             alert("Guests cannot invite friends. Please login or create an account.");
             return;
@@ -2111,25 +2552,23 @@
         document.getElementById('invite-modal').classList.add('hidden');
     }
 
-    function sendFriendInvite() {
+
+    async function sendFriendInvite() {
         const friendName = document.getElementById('invite-friend-input').value.trim();
-        if(!friendName) return alert("Please enter a username.");
-        if(friendName.toLowerCase() === currentUser.username.toLowerCase()) return alert("You cannot invite yourself!");
-
-        let targetRec = playersDatabase.find(p => p.username.toLowerCase() === friendName.toLowerCase());
-        if(!targetRec) {
-            targetRec = { username: friendName, isMod: false, isBanned: false, membership: "Member", badges: [], bio: "", friends: [], followers: [], friendRequests: [], inbox: [] };
-            playersDatabase.push(targetRec);
+        if (!friendName) return alert('Please enter a username.');
+        if (friendName.toLowerCase() === currentUser.username.toLowerCase()) return alert('You cannot invite yourself!');
+        const target = findCloudUserByName(friendName);
+        if (target && target.uid && dohbloxCloudCurrentUid && await ensureDohbloxCloud(false)) {
+            await dohbloxCloudDb.collection('dohblox_notifications').doc(target.uid).collection('items').add({
+                senderUid: dohbloxCloudCurrentUid, senderName: currentUser.username,
+                text: `${currentUser.username} invited you to play Dohblox!`, createdAtMs: Date.now()
+            });
+            closeInviteModal(); alert(`Invitation sent to ${friendName}!`); return;
         }
-
-        if(!targetRec.inbox) targetRec.inbox = [];
-        targetRec.inbox.push({ id: Date.now(), sender: currentUser.username, text: `${currentUser.username} invited you to play Dohblox!` });
-        saveToStorage();
-        closeInviteModal();
-        alert(`Invitation sent to ${friendName}! They will receive it in their inbox.`);
+        alert('That cloud player was not found.');
     }
 
-    function switchSettingsSubTab(sub) {
+        function switchSettingsSubTab(sub) {
         ['info', 'privacy', 'billing', 'security'].forEach(s => {
             const el = document.getElementById(`sub-setting-${s}`);
             if(el) el.classList.add('hidden');
@@ -2137,65 +2576,64 @@
         document.getElementById(`sub-setting-${sub}`).classList.remove('hidden');
     }
 
-    function saveAccountSettings() {
+
+    async function saveAccountSettings() {
         const newUsername = document.getElementById('setting-username-input').value.trim();
         const newBio = document.getElementById('setting-bio-input').value.trim();
+        if (!newUsername) return alert('Username cannot be empty.');
+        if (isGuestUser(newUsername)) return alert('Guest names are reserved.');
 
-        if(!newUsername) return alert("Username cannot be empty.");
-
-        let playerRecord = playersDatabase.find(p => p.username.toLowerCase() === currentUser.username.toLowerCase());
-        if(playerRecord) {
-            playerRecord.username = newUsername;
-            playerRecord.bio = newBio;
+        if (await ensureDohbloxCloud(false) && dohbloxCloudAuth.currentUser && !dohbloxCloudAuth.currentUser.isAnonymous) {
+            try {
+                const key = normalizeDohbloxUsername(newUsername);
+                if (key !== normalizeDohbloxUsername(currentUser.username)) {
+                    const exists = await dohbloxCloudDb.collection('dohblox_users').where('normalizedUsername', '==', key).limit(1).get();
+                    if (!exists.empty && exists.docs[0].id !== dohbloxCloudAuth.currentUser.uid) return alert('That username is already taken.');
+                    await dohbloxCloudAuth.currentUser.updateEmail(usernameToAuthEmail(newUsername));
+                }
+                currentUser.username = newUsername;
+                currentUser.bio = newBio;
+                await dohbloxCloudDb.collection('dohblox_users').doc(dohbloxCloudAuth.currentUser.uid).set(cloudProfilePayload(), { merge: true });
+            } catch (err) {
+                console.error('Profile update failed:', err);
+                alert('Could not update the cloud profile. You may need to log in again before changing your username.');
+                return;
+            }
+        } else {
+            currentUser.username = newUsername;
+            currentUser.bio = newBio;
         }
-
-        currentUser.username = newUsername;
         saveToStorage();
         renderHeader();
-        alert("Account settings saved!");
+        alert('Account settings saved!');
     }
 
-    function updatePassword() {
+    
+    async function updatePassword() {
         const currentPass = document.getElementById('setting-current-password').value;
         const newPass = document.getElementById('setting-new-password').value;
         const confirmPass = document.getElementById('setting-confirm-password').value;
+        if (!currentPass || !newPass || !confirmPass) return alert('Please fill in all password fields.');
+        if (newPass !== confirmPass) return alert('New passwords do not match.');
+        if (newPass.length < 6) return alert('New password must be at least 6 characters long.');
+        if (!await ensureDohbloxCloud(true) || !dohbloxCloudAuth.currentUser || dohbloxCloudAuth.currentUser.isAnonymous) return alert('Log in to your cloud account first.');
 
-        if (!currentPass || !newPass || !confirmPass) {
-            return alert("Please fill in all password fields.");
+        try {
+            const user = dohbloxCloudAuth.currentUser;
+            const credential = firebase.auth.EmailAuthProvider.credential(user.email, currentPass);
+            await user.reauthenticateWithCredential(credential);
+            await user.updatePassword(newPass);
+            document.getElementById('setting-current-password').value = '';
+            document.getElementById('setting-new-password').value = '';
+            document.getElementById('setting-confirm-password').value = '';
+            alert('Password updated securely in Firebase Authentication!');
+        } catch (err) {
+            console.warn('Password change failed:', err);
+            alert('Current password is incorrect, or Firebase requires you to log in again.');
         }
-
-        let userRecord = playersDatabase.find(p => p.username.toLowerCase() === currentUser.username.toLowerCase());
-        const userPassword = userRecord && userRecord.password ? userRecord.password : OWNER_PASSWORD;
-
-        if (currentPass !== userPassword) {
-            return alert("Current password is incorrect.");
-        }
-
-        if (newPass !== confirmPass) {
-            return alert("New passwords do not match.");
-        }
-
-        if (newPass.length < 4) {
-            return alert("New password must be at least 4 characters long.");
-        }
-
-        if (currentUser.username.toLowerCase() === accountOwnerUsername.toLowerCase()) {
-            OWNER_PASSWORD = newPass;
-        }
-
-        if (userRecord) {
-            userRecord.password = newPass;
-        }
-
-        document.getElementById('setting-current-password').value = '';
-        document.getElementById('setting-new-password').value = '';
-        document.getElementById('setting-confirm-password').value = '';
-
-        saveToStorage();
-        alert("Password updated successfully!");
     }
 
-    function renderHeader() {
+        function renderHeader() {
         if (isGuestUser(currentUser.username)) {
             currentUser.isMod = false;
         }
@@ -2395,26 +2833,20 @@
         ctx.shadowBlur = 0;
     }
 
-    function openLoginModal() {
-        if(!isGuestUser(currentUser.username)) {
+
+    async function openLoginModal() {
+        if (!isGuestUser(currentUser.username)) {
+            await cloudLogout();
             currentUser = {
-                username: "Guest",
-                balance: 0,
-                isMod: false,
-                isBanned: false,
-                membership: "Member",
-                badges: [],
-                inventory: [],
-                equipped: [],
-                friends: [],
-                followers: [],
-                friendRequests: [],
-                inbox: [],
+                username: 'Guest', balance: 0, isMod: false, isBanned: false,
+                membership: 'Member', badges: [], inventory: [], equipped: [],
+                friends: [], followers: [], friendRequests: [], inbox: [],
                 colors: { torso: 0x0055b3, limbs: 0xffcc00 }
             };
-            saveToStorage();
+            localStorage.setItem('dohblox_user', JSON.stringify(currentUser));
             renderHeader();
-            alert("Logged out successfully.");
+            renderInbox();
+            alert('Logged out successfully.');
             return;
         }
         document.getElementById('login-username-input').value = '';
@@ -2422,7 +2854,7 @@
         document.getElementById('login-modal').classList.remove('hidden');
     }
 
-    function closeLoginModal() { document.getElementById('login-modal').classList.add('hidden'); }
+        function closeLoginModal() { document.getElementById('login-modal').classList.add('hidden'); }
 
     function handleUsernameInput(val) {
         const passLabel = document.getElementById('password-label');
@@ -2436,70 +2868,22 @@
         }
     }
 
-    function processLogin() {
+
+    async function processLogin() {
         const val = document.getElementById('login-username-input').value.trim();
         const passVal = document.getElementById('login-password-input').value;
+        if (!val) return alert('Please enter a username.');
+        if (!passVal) return alert('Please enter a password.');
+        if (isGuestUser(val)) return alert('Guest names are reserved. Choose a different username.');
 
-        if(!val) return alert("Please enter a username.");
-        if(!passVal) return alert("Please enter a password.");
-
-        let existing = playersDatabase.find(p => p.username.toLowerCase() === val.toLowerCase());
-
-        if(existing) {
-            if (existing.password && passVal !== existing.password) {
-                alert("Incorrect password!");
-                return;
-            }
-            currentUser.username = existing.username;
-            currentUser.isMod = isGuestUser(existing.username) ? false : existing.isMod;
-            currentUser.membership = existing.membership;
-            currentUser.badges = existing.badges || [];
-            currentUser.balance = existing.balance || 0;
-            currentUser.inventory = existing.inventory || [];
-            currentUser.equipped = existing.equipped || [];
-            currentUser.friends = existing.friends || [];
-            currentUser.followers = existing.followers || [];
-            currentUser.friendRequests = existing.friendRequests || [];
-            currentUser.inbox = existing.inbox || [];
-        } else {
-            currentUser.username = val;
-            currentUser.isMod = (val.toLowerCase() === accountOwnerUsername.toLowerCase());
-            currentUser.membership = "Member";
-            currentUser.badges = [];
-            currentUser.balance = 0;
-            currentUser.inventory = [];
-            currentUser.equipped = [];
-            currentUser.friends = [];
-            currentUser.followers = [];
-            currentUser.friendRequests = [];
-            currentUser.inbox = [];
-            playersDatabase.push({ 
-                username: val, 
-                isMod: currentUser.isMod, 
-                isBanned: false, 
-                membership: "Member", 
-                badges: [], 
-                bio: "New player!", 
-                password: passVal,
-                balance: 0,
-                inventory: [],
-                equipped: [],
-                friends: [],
-                followers: [],
-                friendRequests: [],
-                inbox: []
-            });
-        }
-        if(isGuestUser(currentUser.username)) {
-            currentUser.isMod = false;
-        }
-
-        saveToStorage();
+        const ok = await cloudLoginOrCreate(val, passVal);
+        if (!ok) return;
         renderHeader();
+        renderInbox();
         closeLoginModal();
     }
 
-    function searchPlayerGlobal() {
+        function searchPlayerGlobal() {
         const val = document.getElementById('global-player-search').value.trim();
         if(!val) return;
         inspectReportedUser(val);
@@ -2842,34 +3226,34 @@
         setTimeout(() => initProfile3D(), 10);
     }
 
-    function sendFriendRequest(targetName) {
-        let targetRec = playersDatabase.find(p => p.username.toLowerCase() === targetName.toLowerCase());
-        if(!targetRec) {
-            targetRec = { username: targetName, friends: [], followers: [], friendRequests: [], inbox: [] };
-            playersDatabase.push(targetRec);
-        }
-        if(!targetRec.friendRequests) targetRec.friendRequests = [];
-        if(!targetRec.friendRequests.includes(currentUser.username)) {
-            targetRec.friendRequests.push(currentUser.username);
-            saveToStorage();
-            alert(`Friend request sent to ${targetName}!`);
-        } else {
-            alert("Friend request already sent!");
-        }
+
+    async function sendFriendRequest(targetName) {
+        if (isGuestUser(currentUser.username)) return alert('Log in before sending friend requests.');
+        const target = findCloudUserByName(targetName);
+        if (!target || !target.uid) return alert('That player was not found in the cloud directory.');
+        if (!dohbloxCloudCurrentUid || !await ensureDohbloxCloud(true)) return;
+        if (target.uid === dohbloxCloudCurrentUid) return alert('You cannot friend yourself.');
+        await dohbloxCloudDb.collection('dohblox_friend_requests').doc(target.uid).collection('requests').doc(dohbloxCloudCurrentUid).set({
+            senderUid: dohbloxCloudCurrentUid, senderName: currentUser.username, createdAtMs: Date.now()
+        });
+        alert(`Friend request sent to ${targetName}!`);
     }
 
-    function unfriendUser(targetName) {
-        currentUser.friends = currentUser.friends.filter(f => f !== targetName);
-        let targetRec = playersDatabase.find(p => p.username.toLowerCase() === targetName.toLowerCase());
-        if(targetRec && targetRec.friends) {
-            targetRec.friends = targetRec.friends.filter(f => f !== currentUser.username);
+    
+    async function unfriendUser(targetName) {
+        const target = findCloudUserByName(targetName);
+        if (target && target.uid && dohbloxCloudCurrentUid && await ensureDohbloxCloud(false)) {
+            const pairId = makeFriendPairId(dohbloxCloudCurrentUid, target.uid);
+            await dohbloxCloudDb.collection('dohblox_friendships').doc(pairId).delete().catch(() => {});
+        } else {
+            currentUser.friends = currentUser.friends.filter(f => f !== targetName);
+            saveToStorage();
         }
-        saveToStorage();
         loadProfileView(targetName);
         alert(`You are no longer friends with ${targetName}.`);
     }
 
-    function initProfile3D() {
+        function initProfile3D() {
         const c = document.getElementById('profile-avatar-container');
         if(!c || c.clientWidth === 0) return;
 
@@ -4298,8 +4682,7 @@
 
         if (lower === '/announce' || lower.startsWith('/announce ')) {
             const announcement = msg.slice('/announce'.length).trim();
-            const isOwner = currentUser.username && currentUser.username.toLowerCase() === accountOwnerUsername.toLowerCase();
-            const authorized = !isGuestUser(currentUser.username) && (currentUser.isMod || isOwner);
+            const authorized = !isGuestUser(currentUser.username) && currentUser.isMod;
 
             if (!authorized) {
                 addChatMessageUI('System', 'Only moderators and the owner can use /announce.');
@@ -5386,14 +5769,17 @@
         updateGameLeaderboard();
         updateESCMenuPlayerList();
 
-        sendNetworkMessage('JOIN_GAME', {
-            colors: currentUser.colors,
-            equipped: currentUser.equipped,
-            position: playerPos,
-            pizzaOrder: getLocalPizzaOrderNetworkState(),
-            pizzaVehicle: isPizzaPlaceActive() ? (pizzaInBike ? 'bike' : pizzaInCar ? 'car' : null) : null,
-            pizzaVehicleYaw: pizzaInBike ? pizzaBikeYaw : pizzaInCar ? pizzaCarYaw : null,
-            ndsInfected: isNaturalDisasterActive() ? ndsInfected : false
+        joinCloudGameRoom(gameTitle).then(() => {
+            sendNetworkMessage('JOIN_GAME', {
+                colors: currentUser.colors,
+                equipped: currentUser.equipped,
+                position: playerPos,
+                yaw: cameraYaw,
+                pizzaOrder: getLocalPizzaOrderNetworkState(),
+                pizzaVehicle: isPizzaPlaceActive() ? (pizzaInBike ? 'bike' : pizzaInCar ? 'car' : null) : null,
+                pizzaVehicleYaw: pizzaInBike ? pizzaBikeYaw : pizzaInCar ? pizzaCarYaw : null,
+                ndsInfected: isNaturalDisasterActive() ? ndsInfected : false
+            });
         });
 
         if (heartbeatTimer) clearInterval(heartbeatTimer);
@@ -6141,6 +6527,7 @@
         stopBoomboxMusic();
         localDanceUntil = 0;
         sendNetworkMessage('LEAVE_GAME', {});
+        leaveCloudGameRoom(true);
         activeGameTitle = null;
 
         for (let id in remotePlayers) {
