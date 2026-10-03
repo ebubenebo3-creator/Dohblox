@@ -1,0 +1,28 @@
+DOHBLOX PUBLIC STUDIO — FIREBASE SETUP
+
+1. Create a Firebase project at the Firebase Console.
+2. Build > Firestore Database > Create database.
+3. Build > Authentication > Sign-in method > enable Anonymous.
+4. Firestore Database > Rules:
+   paste everything from DOHBLOX_FIREBASE_FIRESTORE_RULES.rules and Publish the rules.
+5. Project Settings > General > Your apps > Add app > Web.
+6. Copy these two values from firebaseConfig:
+      projectId
+      apiKey
+7. In BOTH Dohblox HTML files, search for:
+      FIREBASE_STUDIO_DEFAULT
+   Replace:
+      YOUR_FIREBASE_PROJECT_ID
+      YOUR_FIREBASE_WEB_API_KEY
+   with your actual values.
+8. Upload/release both HTML files again.
+
+TESTING WITHOUT EDITING THE FILE:
+Inside Dohblox Studio click "Firebase Setup" and enter your Project ID and Web API key.
+That test setup is stored only in that browser, so hard-code the two values before releasing to everybody.
+
+IMPORTANT:
+- The Firebase Web API key is a public client configuration value. Do not paste a service-account JSON private key into the HTML.
+- The Firestore rules are what stop random visitors from editing/deleting other people's games.
+- Public games can be viewed on any PC/mobile Dohblox build using the same Firebase project.
+- The creator can update/delete their game from the same browser profile because Firebase Anonymous Authentication persists that creator identity locally.
